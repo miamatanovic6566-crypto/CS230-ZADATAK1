@@ -1,0 +1,137 @@
+
+import socket
+import threading
+import datetime
+import os
+
+MW_HOST    = "127.0.0.1"
+MW_PORT    = 8080
+SRV_HOST   = "127.0.0.1"
+SRV_PORT   = 9000
+TIMEOUT    = 3
+LOG_FILE   = "failed_requests.log"
+FALLBACK   = "Server trenutno nije dostupan, zahtev je zapamćen.\n"
+
+log_lock = threading.Lock()
+
+
+def log_failed(request: str):
+    
+    entry = f"[{ts}] FAILED: {request.strip()}\n"
+    with log_lock:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(entry)
+    print(f"[MW] Zahtjev zabilježen u {LOG_FILE}: {request.strip()}")
+
+
+def forward_to_server(request: str) -> str:
+   
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(TIMEOUT)
+        s.connect((SRV_HOST, SRV_PORT))
+        s.sendall(request.encode("utf-8"))
+        s.shutdown(socket.SHUT_WR)
+        chunks = []
+        while chunk := s.recv(4096):
+            chunks.append(chunk.decode("utf-8"))
+        return "".join(chunks)
+
+
+def handle_client(conn: socket.socket, addr: tuple):
+    with conn:
+        try:
+            request = conn.recv(4096).decode("utf-8")
+            if not request:
+                return
+            print(f"[MW] Primio zahtjev od {addr}: '{request.strip()}'")
+
+            try:
+                response = forward_to_server(request)
+                print(f"[MW] Server odgovorio: '{response.strip()}'")
+                conn.sendall(response.encode("utf-8"))
+
+            except (ConnectionRefusedError, TimeoutError, OSError) as e:
+                print(f"[MW] Server nedostupan ({type(e).__name__}), beležim zahtev.")
+                log_failed(request)
+                conn.sendall(FALLBACK.encode("utf-8"))
+
+        except OSError as e:
+            print(f"[MW] Greška pri čitanju od klijenta: {e}")
+
+
+def run():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((MW_HOST, MW_PORT))
+        srv.listen()
+        print(f"[MW] Middleware aktivan na {MW_HOST}:{MW_PORT}")
+        print(f"[MW] Prosljeđuje na {SRV_HOST}:{SRV_PORT}  |  timeout={TIMEOUT}s")
+        while True:
+            conn, addr = srv.accept()
+            threading.Thread(
+                target=handle_client,
+                args=(conn, addr),
+                daemon=True
+            ).start()
+
+
+if __name__ == "__main__":
+    run()
+
+server.py
+
+import socket
+import threading
+
+HOST = "127.0.0.1"
+PORT = 9000
+
+
+def handle(conn: socket.socket, addr: tuple):
+    with conn:
+        data = conn.recv(4096).decode("utf-8").strip()
+        print(f"[Server] Primio: '{data}'")
+        response = f"Server obradio zahtjev: '{data}'\n"
+        conn.sendall(response.encode("utf-8"))
+
+
+def run():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((HOST, PORT))
+        srv.listen()
+        print(f"[Server] Aktivan na {HOST}:{PORT}")
+        while True:
+            conn, addr = srv.accept()
+            threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
+
+
+if __name__ == "__main__":
+    run()
+
+
+client.py
+
+import socket
+import sys
+
+MW_HOST = "127.0.0.1"
+MW_PORT = 8080
+
+
+def send(message: str):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((MW_HOST, MW_PORT))
+        s.sendall(message.encode("utf-8"))
+        s.shutdown(socket.SHUT_WR)
+        chunks = []
+        while chunk := s.recv(4096):
+            chunks.append(chunk.decode("utf-8"))
+    response = "".join(chunks).strip()
+    print(f"[Client] Odgovor: '{response}'")
+
+
+if __name__ == "__main__":
+    msg = " ".join(sys.argv[1:]) or "GET /health"
+    print(f"[Client] Šaljem: '{msg}'")
+    send(msg)
