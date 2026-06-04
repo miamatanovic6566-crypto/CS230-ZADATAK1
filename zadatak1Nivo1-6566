@@ -1,0 +1,28 @@
+import time
+
+def calculate_sum(n):
+   
+    return sum(range(n + 1))
+
+
+def timed_wrapper(func):
+   
+    def wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        elapsed = end_time - start_time
+        print(f"Funkcija '{func.name}' izvršena za {elapsed:.6f} sekundi.")
+        return result
+    return wrapper
+
+
+timed_calculate_sum = timed_wrapper(calculate_sum)
+
+
+if __name__ == "main":
+    result = timed_calculate_sum(100)
+    print(f"Suma od 0 do 100 = {result}")
+
+    result = timed_calculate_sum(1_000_000)
+    print(f"Suma od 0 do 1,000,000 = {result}")
