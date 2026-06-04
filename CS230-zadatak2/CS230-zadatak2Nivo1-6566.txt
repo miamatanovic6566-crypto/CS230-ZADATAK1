@@ -1,0 +1,52 @@
+import time
+import functools
+
+
+def performance_interceptor(func):
+    
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        print(f"[INTERCEPTOR] '{func.name}' izvršena za {elapsed:.6f}s")
+        return result
+    return wrapper
+
+
+
+@performance_interceptor
+def calculate_sum(n):
+    
+    return sum(range(n + 1))
+
+
+@performance_interceptor
+def bubble_sort(arr):
+  
+    arr = arr.copy()
+    n = len(arr)
+    for i in range(n):
+        for j in range(0, n - i - 1):
+            if arr[j] > arr[j + 1]:
+                arr[j], arr[j + 1] = arr[j + 1], arr[j]
+    return arr
+
+
+@performance_interceptor
+def fibonacci(n):
+ 
+    if n <= 1:
+        return n
+    return fibonacci.wrapped(n - 1) + fibonacci.wrapped(n - 2)
+
+
+if name == "main":
+    result = calculate_sum(1_000_000)
+    print(f"  → {result}\n")
+
+    sorted_arr = bubble_sort([64, 34, 25, 12, 22, 11, 90])
+    print(f"  → {sorted_arr}\n")
+
+    fib = fibonacci(30)
+    print(f"  → {fib}")
