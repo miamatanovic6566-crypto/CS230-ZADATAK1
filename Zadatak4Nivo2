@@ -1,0 +1,187 @@
+import os
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+
+class FileServer:
+    def __init__(self, name: str, root_dir: str):
+        self.name = name
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+    
+    def write_file(self, relative_path: str, content: str) -> bool:
+        full_path = self.root_dir / relative_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(full_path, 'w') as f:
+            f.write(content)
+        return True
+    
+    def read_file(self, relative_path: str) -> Optional[str]:
+        full_path = self.root_dir / relative_path
+        if full_path.exists() and full_path.is_file():
+            with open(full_path, 'r') as f:
+                return f.read()
+        return None
+    
+    def get_closest_existing_path(self, relative_path: str) -> str:
+       
+        path = Path(relative_path)
+        # Proveravamo od cele putanje pa naviše
+        for parent in [path] + list(path.parents):
+            if (self.root_dir / parent).exists():
+                return str(parent)
+        return ""  # čak ni root ne postoji (prazan string znači root dir servera)
+    
+    def list_dir(self, relative_path: str) -> List[str]:
+        full_path = self.root_dir / relative_path
+        if full_path.exists() and full_path.is_dir():
+            return [str(p.relative_to(self.root_dir)) for p in full_path.iterdir()]
+        return []
+
+
+class DistributedFSMiddleware:
+    def __init__(self):
+        self.servers: Dict[str, FileServer] = {}  
+        self.mapping: Dict[str, str] = {}          
+    
+    def register_server(self, server_name: str, root_dir: str) -> None:
+       
+        server = FileServer(server_name, root_dir)
+        self.servers[server_name] = server
+        self._scan_and_map(server_name)
+    
+    def _scan_and_map(self, server_name: str) -> None:
+     
+        server = self.servers[server_name]
+        for root, dirs, files in os.walk(server.root_dir):
+            rel_root = Path(root).relative_to(server.root_dir)
+            # Mapiraj direktorijum
+            if str(rel_root) != ".":
+                self.mapping[f"/{server_name}/{rel_root}"] = server_name
+            for f in files:
+                full_path = f"/{server_name}/{rel_root}/{f}"
+                self.mapping[full_path] = server_name
+    
+    def map_path(self, full_path: str, server_name: str) -> None:
+        """Ručno mapiranje putanje na server (npr. /server1/data/folder/file.txt)."""
+        self.mapping[full_path] = server_name
+    
+    def _find_server_for_path(self, full_path: str) -> Tuple[Optional[FileServer], str]:
+        
+      
+        if full_path in self.mapping:
+            server_name = self.mapping[full_path]
+            server = self.servers.get(server_name)
+            if server:
+               
+                rel = full_path[len(f"/{server_name}"):]
+                return server, rel.lstrip("/")
+      
+        parts = full_path.strip("/").split("/", 1)
+        if len(parts) >= 1:
+            potential_server = parts[0]
+            if potential_server in self.servers:
+                server = self.servers[potential_server]
+                rel_path = parts[1] if len(parts) > 1 else ""
+               
+                if server.read_file(rel_path) is not None:
+                   
+                    self.mapping[full_path] = potential_server
+                    return server, rel_path
+                else:
+                    
+                    closest = server.get_closest_existing_path(rel_path)
+                    return server, closest
+        
+    
+        best_match = None
+        best_server = None
+        for mapped_path, srv_name in self.mapping.items():
+            if full_path.startswith(mapped_path) and len(mapped_path) > len(best_match or ""):
+                best_match = mapped_path
+                best_server = srv_name
+        
+        if best_server:
+            server = self.servers[best_server]
+            # Vrati relativnu putanju unutar tog servera
+            rel_on_server = full_path[len(best_match):].lstrip("/")
+            return server, rel_on_server
+        
+        return None, 
+    
+    def read_file(self, full_path: str) -> Tuple[Optional[str], Optional[str]]:
+       
+        server, rel_path = self._find_server_for_path(full_path)
+        if server is None:
+            return None, ""  # nijedan server ne zna za ovu putanju
+        
+     
+        content = server.read_file(rel_path)
+        if content is not None:
+            return content, None
+        
+     
+        closest = server.get_closest_existing_path(rel_path)
+        if closest:
+          
+            closest_full = f"/{server.name}/{closest}" if closest else f"/{server.name}"
+        else:
+            closest_full = f"/{server.name}"
+        
+        return None, closest_full
+    
+    def write_file(self, full_path: str, content: str) -> bool:
+     
+        server, rel_path = self._find_server_for_path(full_path)
+        if server is None:
+            return False
+        success = server.write_file(rel_path, content)
+        if success:
+            self.mapping[full_path] = server.name
+        return success
+    
+    def get_closest_existing(self, full_path: str) -> str:
+        
+        _, closest = self.read_file(full_path)
+        return closest if closest else ""
+
+
+class DistributedFSClient:
+    def __init__(self, middleware: DistributedFSMiddleware):
+        self.mw = middleware
+    
+    def get_file(self, path: str) -> str:
+        content, closest = self.mw.read_file(path)
+        if content is not None:
+            return f" Sadržaj fajla '{path}':\n{content}"
+        else:
+            return f" Fajl '{path}' ne postoji. Najbliža postojeća putanja: '{closest}'"
+    
+    def put_file(self, path: str, content: str) -> str:
+        if self.mw.write_file(path, content):
+            return f" Fajl '{path}' uspešno sačuvan."
+        return f" Greška pri čuvanju fajla '{path}'."
+
+
+if __name__ == "__main__":
+
+    mw = DistributedFSMiddleware()
+    
+ 
+    mw.register_server("server1", "./data/server1")
+    mw.register_server("server2", "./data/server2")
+    
+  
+    mw.write_file("/server1/folder/file.txt", "Hello from server1")
+    mw.write_file("/server2/data/notes.txt", "Server2 notes")
+    
+
+    client = DistributedFSClient(mw)
+    
+    
+    print(client.get_file("/server1/folder/file.txt"))
+    print(client.get_file("/server1/folder/missing.txt"))
+    print(client.get_file("/server2/data/notes.txt"))
+    print(client.get_file("/server2/nonexistent/deep/path/file.log"))
+    print(client.get_file("/server3/unknown.txt"))  
