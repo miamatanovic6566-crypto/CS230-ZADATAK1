@@ -1,0 +1,244 @@
+import signal
+from functools import wraps
+import time
+
+
+class TimeoutError(Exception):
+    pass
+
+def timeout(seconds=2):
+  
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+           
+            def _timeout_handler(signum, frame):
+                raise TimeoutError(f"Funkcija {func.__name__} traje duže od {seconds} sekundi")
+            
+         
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(seconds)
+            
+            try:
+                result = func(*args, **kwargs)
+                signal.alarm(0)  # Otkaži alarm
+                return result
+            except TimeoutError:
+                wrapper.timeout_occurred = True
+                return None
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+        
+        wrapper.timeout_occurred = False
+        return wrapper
+    return decorator
+
+
+
+class FileServerWithDelay(FileServer):
+    def __init__(self, name: str, root_dir: str, delay_seconds: float = 0):
+        super().__init__(name, root_dir)
+        self.delay_seconds = delay_seconds
+    
+    def read_file(self, relative_path: str) -> Optional[str]:
+        if self.delay_seconds > 0:
+            time.sleep(self.delay_seconds)  # Simulacija sporog odgovora
+        return super().read_file(relative_path)
+    
+    def get_closest_existing_path(self, relative_path: str) -> str:
+        if self.delay_seconds > 0:
+            time.sleep(self.delay_seconds)
+        return super().get_closest_existing_path(relative_path)
+
+
+
+class DistributedFSMiddlewareWithTimeout(DistributedFSMiddleware):
+    def __init__(self):
+        super().__init__()
+        self.timeout_seconds = 2
+    
+    @timeout(2)  # Dekorator za timeout
+    def _call_server_read(self, server: FileServer, rel_path: str) -> Optional[str]:
+        """Timeout-ovani poziv server.read_file()"""
+        return server.read_file(rel_path)
+    
+    @timeout(2)
+    def _call_server_closest(self, server: FileServer, rel_path: str) -> str:
+       
+        return server.get_closest_existing_path(rel_path)
+    
+    def read_file(self, full_path: str) -> Tuple[Optional[str], Optional[str]]:
+        
+        server, rel_path = self._find_server_for_path(full_path)
+        if server is None:
+            return None, ""  # server ne postoji
+        
+      
+        content = self._call_server_read(server, rel_path)
+        
+     
+        if hasattr(self._call_server_read, 'timeout_occurred') and self._call_server_read.timeout_occurred:
+            self._call_server_read.timeout_occurred = False  # Reset za sledeći poziv
+            return None, "Vreme čekanja isteklo"
+        
+        if content is not None:
+            return content, None
+        
+      
+        closest = self._call_server_closest(server, rel_path)
+        
+        if hasattr(self._call_server_closest, 'timeout_occurred') and self._call_server_closest.timeout_occurred:
+            self._call_server_closest.timeout_occurred = False
+            return None, "Vreme čekanja isteklo"
+        
+        if closest:
+            closest_full = f"/{server.name}/{closest}" if closest else f"/{server.name}"
+        else:
+            closest_full = f"/{server.name}"
+        
+        return None, closest_full
+    
+    def register_server(self, server_name: str, root_dir: str, delay_seconds: float = 0) -> None:
+        
+        server = FileServerWithDelay(server_name, root_dir, delay_seconds)
+        self.servers[server_name] = server
+        self._scan_and_map(server_name)
+
+
+
+class DistributedFSClientWithTimeout(DistributedFSClient):
+    def get_file(self, path: str) -> str:
+        content, closest = self.mw.read_file(path)
+        if content is not None:
+            return f" Sadržaj fajla '{path}':\n{content}"
+        elif closest == "Vreme čekanja isteklo":
+            return f" Vreme čekanja isteklo za fajl '{path}' - server ne odgovara."
+        else:
+            return f" Fajl '{path}' ne postoji. Najbliža postojeća putanja: '{closest}'"
+
+
+
+def test_timeout():
+    print("\n" + "="*60)
+    print("TESTIRANJE TIMEOUT DEKORATORA")
+    print("="*60)
+    
+    mw = DistributedFSMiddlewareWithTimeout()
+    
+    # Registrujemo servere sa različitim kašnjenjima
+    mw.register_server("server1", "./data/server1", delay_seconds=0.1)  
+    mw.register_server("server2", "./data/server2", delay_seconds=3)     
+    
+    # Upisujemo test fajlove
+    mw.write_file("/server1/quick.txt", "Ovo je brzi odgovor")
+    mw.write_file("/server2/slow.txt", "Ovo je spori odgovor koji kasni")
+    
+    client = DistributedFSClientWithTimeout(mw)
+    
+  
+    print("\n1. Čitanje sa brzog servera (0.1s):")
+    print(client.get_file("/server1/quick.txt"))
+    
+   
+    print("\n2. Čitanje sa sporog servera (3s, timeout 2s):")
+    print(client.get_file("/server2/slow.txt"))
+    
+   
+    print("\n3. Čitanje nepostojećeg fajla na sporom serveru:")
+    print(client.get_file("/server2/missing.txt"))
+
+    print("\n4. Nepostojeći fajl na brzom serveru:")
+    print(client.get_file("/server1/nonexistent/deep/file.txt"))
+
+
+
+import threading
+
+class TimeoutFunction:
+    
+    def __init__(self, func, timeout_seconds):
+        self.func = func
+        self.timeout_seconds = timeout_seconds
+        self.result = None
+        self.error = None
+        self.timed_out = False
+    
+    def _target(self, args, kwargs):
+        try:
+            self.result = self.func(*args, **kwargs)
+        except Exception as e:
+            self.error = e
+    
+    def call(self, *args, **kwargs):
+        thread = threading.Thread(target=self._target, args=(args, kwargs))
+        thread.daemon = True
+        thread.start()
+        thread.join(self.timeout_seconds)
+        
+        if thread.is_alive():
+            self.timed_out = True
+            return None
+        if self.error:
+            raise self.error
+        return self.result
+
+
+
+def timeout_thread(seconds=2):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            tf = TimeoutFunction(func, seconds)
+            result = tf.call(*args, **kwargs)
+            if tf.timed_out:
+                wrapper.timeout_occurred = True
+                return None
+            wrapper.timeout_occurred = False
+            return result
+        wrapper.timeout_occurred = False
+        return wrapper
+    return decorator
+
+class DistributedFSMiddlewareThreadTimeout(DistributedFSMiddleware):
+    def __init__(self):
+        super().__init__()
+        self.timeout_seconds = 2
+    
+    @timeout_thread(2)
+    def _call_server_read(self, server, rel_path):
+        return server.read_file(rel_path)
+    
+    @timeout_thread(2)
+    def _call_server_closest(self, server, rel_path):
+        return server.get_closest_existing_path(rel_path)
+    
+   
+    def read_file(self, full_path: str):
+        server, rel_path = self._find_server_for_path(full_path)
+        if server is None:
+            return None, ""
+        
+        content = self._call_server_read(server, rel_path)
+        if hasattr(self._call_server_read, 'timeout_occurred') and self._call_server_read.timeout_occurred:
+            self._call_server_read.timeout_occurred = False
+            return None, "Vreme čekanja isteklo"
+        
+        if content is not None:
+            return content, None
+        
+        closest = self._call_server_closest(server, rel_path)
+        if hasattr(self._call_server_closest, 'timeout_occurred') and self._call_server_closest.timeout_occurred:
+            self._call_server_closest.timeout_occurred = False
+            return None, "Vreme čekanja isteklo"
+        
+        if closest:
+            closest_full = f"/{server.name}/{closest}" if closest else f"/{server.name}"
+        else:
+            closest_full = f"/{server.name}"
+        
+        return None, closest_full
+
+
+if __name__ == "__main__":
+    test_timeout()
