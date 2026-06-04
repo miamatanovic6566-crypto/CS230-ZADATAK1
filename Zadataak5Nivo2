@@ -1,0 +1,427 @@
+import os
+import time
+import threading
+import uuid
+from typing import Dict, List, Tuple, Optional, Callable
+from pathlib import Path
+from enum import Enum
+from queue import Queue
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class FileServer:
+    def __init__(self, name: str, root_dir: str, processing_delay: float = 0):
+        self.name = name
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.processing_delay = processing_delay  # Simulacija vremena obrade
+        self.middleware_callback = None  # Callback ka middleware-u
+    
+    def set_middleware_callback(self, callback):
+      
+        self.middleware_callback = callback
+    
+    def write_file(self, relative_path: str, content: str) -> bool:
+        full_path = self.root_dir / relative_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(full_path, 'w') as f:
+            f.write(content)
+        return True
+    
+    def read_file(self, relative_path: str) -> Optional[str]:
+        if self.processing_delay > 0:
+            time.sleep(self.processing_delay)  # Simulacija obrade
+        full_path = self.root_dir / relative_path
+        if full_path.exists() and full_path.is_file():
+            with open(full_path, 'r') as f:
+                return f.read()
+        return None
+    
+    def get_closest_existing_path(self, relative_path: str) -> str:
+        if self.processing_delay > 0:
+            time.sleep(self.processing_delay)
+        path = Path(relative_path)
+        for parent in [path] + list(path.parents):
+            if (self.root_dir / parent).exists():
+                return str(parent)
+        return ""
+    
+    def process_request_async(self, request_id: str, relative_path: str, client_callback: Callable):
+        
+        def process():
+           
+            if self.processing_delay > 0:
+                time.sleep(self.processing_delay)
+            
+          
+            content = self.read_file(relative_path)
+            if content is not None:
+                result = {
+                    'request_id': request_id,
+                    'success': True,
+                    'content': content,
+                    'closest_path': None
+                }
+            else:
+                closest = self.get_closest_existing_path(relative_path)
+                result = {
+                    'request_id': request_id,
+                    'success': False,
+                    'content': None,
+                    'closest_path': closest if closest else f"/{self.name}"
+                }
+            
+            
+            if self.middleware_callback:
+                self.middleware_callback(result)
+            else:
+                logger.error(f"Server {self.name}: Nema postavljenog middleware callback-a")
+        
+        
+        thread = threading.Thread(target=process, daemon=True)
+        thread.start()
+        logger.info(f"Server {self.name}: Započeta asinhrona obrada zahteva {request_id} za putanju {relative_path}")
+
+
+class RequestStatus(Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    TIMEOUT = "timeout"
+
+class AsyncRequest:
+   
+    def __init__(self, request_id: str, client_callback: Callable, timestamp: float):
+        self.request_id = request_id
+        self.client_callback = client_callback
+        self.timestamp = timestamp
+        self.status = RequestStatus.PENDING
+        self.result = None
+
+class DistributedFSMiddleware:
+    def __init__(self, request_timeout: float = 5.0):
+        self.servers: Dict[str, FileServer] = {}
+        self.mapping: Dict[str, str] = {}
+        self.pending_requests: Dict[str, AsyncRequest] = {}
+        self.request_timeout = request_timeout
+        self.timeout_checker_running = False
+        
+    def register_server(self, server_name: str, root_dir: str, processing_delay: float = 0) -> None:
+        """Registruje server i postavlja callback ka middleware-u"""
+        server = FileServer(server_name, root_dir, processing_delay)
+        server.set_middleware_callback(self.on_server_response)
+        self.servers[server_name] = server
+        self._scan_and_map(server_name)
+        logger.info(f"Middleware: Registrovan server {server_name} sa kašnjenjem od {processing_delay}s")
+    
+    def _scan_and_map(self, server_name: str) -> None:
+        
+        server = self.servers[server_name]
+        for root, dirs, files in os.walk(server.root_dir):
+            rel_root = Path(root).relative_to(server.root_dir)
+            if str(rel_root) != ".":
+                self.mapping[f"/{server_name}/{rel_root}"] = server_name
+            for f in files:
+                full_path = f"/{server_name}/{rel_root}/{f}"
+                self.mapping[full_path] = server_name
+    
+    def _find_server_for_path(self, full_path: str) -> Tuple[Optional[FileServer], str]:
+       
+        parts = full_path.strip("/").split("/", 1)
+        if len(parts) >= 1:
+            potential_server = parts[0]
+            if potential_server in self.servers:
+                server = self.servers[potential_server]
+                rel_path = parts[1] if len(parts) > 1 else ""
+                return server, rel_path
+        return None, ""
+    
+    def on_server_response(self, result: dict):
+       
+        request_id = result['request_id']
+        
+        if request_id in self.pending_requests:
+            async_req = self.pending_requests[request_id]
+            async_req.status = RequestStatus.COMPLETED
+            async_req.result = result
+            
+            logger.info(f"Middleware: Primljen odgovor od servera za zahtev {request_id}")
+            
+          
+            try:
+                if result['success']:
+                    async_req.client_callback({
+                        'request_id': request_id,
+                        'success': True,
+                        'content': result['content'],
+                        'message': None
+                    })
+                else:
+                    async_req.client_callback({
+                        'request_id': request_id,
+                        'success': False,
+                        'content': None,
+                        'closest_path': result['closest_path'],
+                        'message': None
+                    })
+                logger.info(f"Middleware: Rezultat prosleđen klijentu za zahtev {request_id}")
+            except Exception as e:
+                logger.error(f"Middleware: Greška pri slanju callback-a klijentu: {e}")
+            
+           
+            del self.pending_requests[request_id]
+        else:
+            logger.warning(f"Middleware: Zahtev {request_id} nije pronađen (možda je timeout-ovao)")
+    
+    def search_file_async(self, full_path: str, client_callback: Callable) -> str:
+        
+      
+        request_id = str(uuid.uuid4())
+        
+       
+        server, rel_path = self._find_server_for_path(full_path)
+        
+        if server is None:
+            # Ako server ne postoji, odmah vrati grešku preko callback-a
+            logger.warning(f"Middleware: Server ne postoji za putanju {full_path}")
+            client_callback({
+                'request_id': request_id,
+                'success': False,
+                'content': None,
+                'closest_path': "",
+                'message': f"Server ne postoji za putanju {full_path}"
+            })
+            return request_id
+        
+        
+        async_req = AsyncRequest(request_id, client_callback, time.time())
+        self.pending_requests[request_id] = async_req
+        
+      
+        logger.info(f"Middleware: Prosleđujem zahtev {request_id} serveru {server.name}")
+        server.process_request_async(request_id, rel_path, client_callback)
+     
+        self._start_timeout_checker()
+        
+        return request_id
+    
+    def _start_timeout_checker(self):
+     
+        if not self.timeout_checker_running:
+            self.timeout_checker_running = True
+            thread = threading.Thread(target=self._check_timeouts, daemon=True)
+            thread.start()
+            logger.info("Middleware: Pokrenut timeout checker")
+    
+    def _check_timeouts(self):
+    
+        while self.timeout_checker_running:
+            time.sleep(1)  # Proveravaj svake sekunde
+            current_time = time.time()
+            timed_out_requests = []
+            
+            for req_id, async_req in self.pending_requests.items():
+                if current_time - async_req.timestamp > self.request_timeout:
+                    timed_out_requests.append(req_id)
+            
+            for req_id in timed_out_requests:
+                async_req = self.pending_requests[req_id]
+                async_req.status = RequestStatus.TIMEOUT
+                
+                logger.warning(f"Middleware: Timeout za zahtev {req_id} nakon {self.request_timeout}s")
+                
+              
+                try:
+                    async_req.client_callback({
+                        'request_id': req_id,
+                        'success': False,
+                        'content': None,
+                        'closest_path': None,
+                        'message': f"Vreme čekanja isteklo nakon {self.request_timeout} sekundi"
+                    })
+                except Exception as e:
+                    logger.error(f"Middleware: Greška pri slanju timeout callback-a: {e}")
+                
+              
+                del self.pending_requests[req_id]
+            
+           
+            if len(self.pending_requests) == 0:
+                self.timeout_checker_running = False
+                logger.info("Middleware: Zaustavljen timeout checker (nema pending zahteva)")
+                break
+    
+    def write_file_sync(self, full_path: str, content: str) -> bool:
+       
+        server, rel_path = self._find_server_for_path(full_path)
+        if server is None:
+            return False
+        success = server.write_file(rel_path, content)
+        if success:
+            self.mapping[full_path] = server.name
+        return success
+
+
+class DistributedFSClient:
+    def __init__(self, middleware: DistributedFSMiddleware):
+        self.mw = middleware
+        self.pending_responses: Dict[str, dict] = {}
+        self.response_lock = threading.Lock()
+    
+    def search_file_async(self, path: str, callback: Optional[Callable] = None) -> str:
+        
+        if callback is None:
+          
+            return self._search_with_sync_wait(path)
+        else:
+           
+            return self.mw.search_file_async(path, callback)
+    
+    def _search_with_sync_wait(self, path: str, timeout: float = 10) -> Tuple[bool, Optional[str], Optional[str]]:
+       
+        response_received = threading.Event()
+        result_container = {}
+        
+        def internal_callback(response):
+            result_container['response'] = response
+            response_received.set()
+        
+        request_id = self.mw.search_file_async(path, internal_callback)
+        
+       
+        if response_received.wait(timeout):
+            response = result_container['response']
+            if response['success']:
+                return True, response['content'], None
+            else:
+                return False, None, response.get('closest_path', '')
+        else:
+            
+            return False, None, "Vreme čekanja isteklo (klijent)"
+    
+    def search_file(self, path: str) -> str:
+       
+        success, content, closest = self.search_file_async(path)
+        if success:
+            return f" Sadržaj fajla '{path}':\n{content}"
+        elif closest == "Vreme čekanja isteklo (klijent)":
+            return f" Klijent: Vreme čekanja isteklo za fajl '{path}'"
+        elif closest and "Vreme čekanja isteklo" in closest:
+            return f" Middleware: Vreme čekanja isteklo za fajl '{path}'"
+        else:
+            return f" Fajl '{path}' ne postoji. Najbliža postojeća putanja: '{closest}'"
+
+
+def example_with_callback():
+    print("\n" + "="*60)
+    print("PRIMER 1: ASINHRONI ZAHTEV SA CALLBACK-OM")
+    print("="*60)
+    
+  
+    mw = DistributedFSMiddleware(request_timeout=3.0)
+    mw.register_server("server1", "./data/server1", processing_delay=1)  # Spor server
+    mw.register_server("server2", "./data/server2", processing_delay=0.1)  # Brz server
+    
+   
+    mw.write_file_sync("/server1/docs/report.txt", "Godišnji izveštaj za 2025")
+    mw.write_file_sync("/server2/notes/quick.txt", "Brza beleška")
+    
+   
+    client = DistributedFSClient(mw)
+    
+    
+    def my_callback(response):
+        print(f"\n Callback primljen za zahtev {response['request_id'][:8]}...")
+        if response['success']:
+            print(f"    Sadržaj: {response['content']}")
+        else:
+            if response.get('message'):
+                print(f"    Greška: {response['message']}")
+            else:
+                print(f"    Fajl ne postoji. Najbliža putanja: {response.get('closest_path')}")
+    
+    # Pošalji asinhroni zahtev
+    print("\n📤 Klijent šalje asinhroni zahtev za /server1/docs/report.txt")
+    request_id = client.search_file_async("/server1/docs/report.txt", my_callback)
+    print(f"📨 Middleware je odmah vratio: 'Zahtev primljen' (ID: {request_id[:8]}...)")
+    
+    # Pošalji još jedan zahtev za nepostojeći fajl
+    print("\n Klijent šalje asinhroni zahtev za /server1/docs/missing.txt")
+    request_id2 = client.search_file_async("/server1/docs/missing.txt", my_callback)
+    print(f" Middleware je odmah vratio: 'Zahtev primljen' (ID: {request_id2[:8]}...)")
+    
+    # Sačekaj da se obrade svi zahtevi
+    print("\n Čekanje da se obrade svi asinhroni zahtevi...")
+    time.sleep(5)
+    print(" Svi zahtevi obrađeni")
+
+
+def example_sync_emulation():
+    print("\n" + "="*60)
+    print("PRIMER 2: SINHRONA EMULACIJA ASINHRONOG POZIVA")
+    print("="*60)
+    
+    mw = DistributedFSMiddleware(request_timeout=2.0)
+    mw.register_server("server1", "./data/server1", processing_delay=0.5)
+    mw.write_file_sync("/server1/test.txt", "Hello World")
+    
+    client = DistributedFSClient(mw)
+    
+    # Ovo interno koristi asinhroni mehanizam ali čeka sinhrono
+    print("\n Klijent traži fajl (sinhrono čekanje):")
+    result = client.search_file("/server1/test.txt")
+    print(result)
+    
+    print("\n Klijent traži nepostojeći fajl:")
+    result = client.search_file("/server1/missing.txt")
+    print(result)
+
+
+def example_timeout():
+    print("\n" + "="*60)
+    print("PRIMER 3: ASINHRONI ZAHTEV SA TIMEOUT-OM")
+    print("="*60)
+    
+  
+    mw = DistributedFSMiddleware(request_timeout=2.0)
+    mw.register_server("server1", "./data/server1", processing_delay=3.0)  # Spor server
+    
+    mw.write_file_sync("/server1/slow.txt", "Ovaj fajl se sporo čita")
+    
+    client = DistributedFSClient(mw)
+    
+    results = []
+    
+    def timeout_callback(response):
+        results.append(response)
+        print(f"\n Callback za {response['request_id'][:8]}...")
+        if response.get('message'):
+            print(f"    {response['message']}")
+        elif response['success']:
+            print(f"    Sadržaj: {response['content']}")
+        else:
+            print(f"    Greška: {response}")
+    
+    print(" Klijent šalje zahtev za sporim serverom (3s obrada, timeout 2s)")
+    request_id = client.search_file_async("/server1/slow.txt", timeout_callback)
+    print(f" Odmah dobijen odgovor: 'Zahtev primljen' (ID: {request_id[:8]}...)")
+    
+    
+    print("\n Čekanje 4 sekunde da timeout istekne...")
+    time.sleep(4)
+    
+    if results:
+        print("\n Callback je pozvan sa timeout porukom")
+
+
+if __name__ == "__main__":
+    # Pokreni primere
+    example_with_callback()
+    example_sync_emulation()
+    example_timeout()
+    
+    print("\n" + "="*60)
+    print("SVI TESTOVI ZAVRŠENI")
+    print("="*60)
